@@ -16,9 +16,10 @@ use super::{
     config::Config,
     device_mapper as dm, device_mapper,
     loopdev::{losetup, LoopControl},
-    state::{Container, Repository},
+    state::Container,
 };
 use bitflags::_core::str::Utf8Error;
+use ed25519_dalek::PublicKey;
 use floating_duration::TimeAsFloat;
 use log::{debug, info};
 pub use nix::mount::MsFlags as MountFlags;
@@ -81,22 +82,34 @@ impl MountControl {
         })
     }
 
+    pub(super) async fn try_clone(&self) -> Result<MountControl, Error> {
+        let lc = self.lc.try_clone().await.expect("clone");
+        let dm = self.dm.try_clone().await.expect("clone");
+        let device_mapper_dev = self.device_mapper_dev.clone();
+        Ok(MountControl {
+            lc,
+            dm,
+            device_mapper_dev,
+        })
+    }
+
     pub(super) async fn mount_npk(
         &self,
         npk_path: &Path,
-        repository: &Repository,
+        key: &Option<PublicKey>,
+        repo_id: &str,
         run_dir: &Path,
     ) -> Result<Container, Error> {
         let start = time::Instant::now();
 
         debug!("Mounting {}", npk_path.display());
-        let use_verity = repository.key.is_some();
+        let use_verity = key.is_some();
 
         if let Ok(meta) = metadata(&npk_path).await {
             debug!("Mounting NPK with size {}", meta.len());
         }
 
-        let npk = Npk::from_path(&npk_path, repository.key.as_ref())
+        let npk = Npk::from_path(&npk_path, key.as_ref())
             .await
             .map_err(Error::Npk)?;
 
@@ -113,7 +126,7 @@ impl MountControl {
             root,
             manifest,
             device,
-            repository: repository.id.to_string(),
+            repository: repo_id.to_string(),
         };
         let duration = start.elapsed();
 

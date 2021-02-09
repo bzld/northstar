@@ -22,7 +22,7 @@ use super::{
     Event, EventTx, RepositoryId,
 };
 use crate::api::model::Notification;
-use ed25519_dalek::*;
+use ed25519_dalek::PublicKey;
 use log::{debug, info, warn};
 use npk::{
     manifest::{Manifest, Mount, Name, Version},
@@ -490,7 +490,12 @@ impl State {
         // Install and mount npk
         let mounted_container = self
             .mount_control
-            .mount_npk(&package_in_repository, &repository, &self.config.run_dir)
+            .mount_npk(
+                &package_in_repository,
+                &repository.key,
+                &repository.id,
+                &self.config.run_dir,
+            )
             .await
             .map_err(Error::Mount)?;
 
@@ -751,17 +756,24 @@ impl State {
                 e,
             )
         })?;
-        let mut containers = Vec::new();
 
+        let mut tasks = Vec::new();
         while let Ok(Some(entry)) = dir.next_entry().await {
-            let container = self
-                .mount_control
-                .mount_npk(&entry.path(), repo, &self.config.run_dir)
-                .await
-                .map_err(Error::Mount)?;
-            containers.push(container);
+            let run_dir = self.config.run_dir.clone();
+            let mount_control = self.mount_control.try_clone().await.expect("clone");
+            let key = repo.key;
+            let repo_id = repo_id.to_string();
+            tasks.push(tokio::spawn(async move {
+                mount_control
+                    .mount_npk(&entry.path(), &key, &repo_id, &run_dir)
+                    .await
+                    .map_err(Error::Mount)
+            }));
         }
-
+        let mut containers = Vec::new();
+        for task in tasks {
+            containers.push(task.await.expect("join")?);
+        }
         Ok(containers)
     }
 }

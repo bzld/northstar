@@ -157,6 +157,12 @@ impl Dm {
         Ok(Dm { file })
     }
 
+    pub async fn try_clone(&self) -> Result<Dm, Error> {
+        Ok(Dm {
+            file: self.file.try_clone().expect("clone"),
+        })
+    }
+
     /// Devicemapper version information: Major, Minor, and patchlevel versions.
     pub async fn version(&self) -> Result<(u32, u32, u32), Error> {
         let mut hdr = DmOptions::new().to_ioctl_hdr(None, DmFlags::empty());

@@ -70,16 +70,39 @@ impl LoopControl {
         })
     }
 
-    pub async fn next_free(&self) -> Result<LoopDevice, Error> {
-        let result;
-        unsafe {
-            result = ioctl(self.dev_file.as_raw_fd() as c_int, LOOP_CTL_GET_FREE.into());
+    pub async fn try_clone(&self) -> Result<LoopControl, Error> {
+        Ok(LoopControl {
+            dev_file: self.dev_file.try_clone().await.expect("clone"),
+            dev: self.dev.clone(),
+        })
+    }
+
+    pub async fn attach_next_free(&self, file_fd: RawFd) -> Result<LoopDevice, Error> {
+        const MAX_RETRIES: usize = 16;
+        for _ in 0..MAX_RETRIES {
+            let number;
+            unsafe {
+                number = ioctl(self.dev_file.as_raw_fd() as c_int, LOOP_CTL_GET_FREE.into());
+            }
+            if number < 0 {
+                return Err(Error::NoFreeDeviceFound);
+            }
+
+            let device = LoopDevice::open(&format!("{}{}", self.dev, number)).await?;
+
+            // Attach the file => Associate the loop device with the open file
+            debug!("Trying loop device {}", number);
+            let code = unsafe { ioctl(device.as_raw_fd(), LOOP_SET_FD.into(), file_fd) };
+            if code < 0 {
+                log::error!("LOOP_SET_FD ERR: {}", std::io::Error::last_os_error());
+                continue;
+                // return Err(Error::AssociateWithOpenFile);
+            }
+
+            debug!("Using loop device {}", number);
+            return Ok(device);
         }
-        if result < 0 {
-            Err(Error::NoFreeDeviceFound)
-        } else {
-            Ok(LoopDevice::open(&format!("{}{}", self.dev, result)).await?)
-        }
+        return Err(Error::AssociateWithOpenFile);
     }
 }
 
@@ -111,22 +134,14 @@ impl LoopDevice {
         })
     }
 
-    pub fn attach_file(
+    pub fn configure(
         &self,
-        file_fd: RawFd,
         offset: u64,
         sizelimit: u64,
         read_only: bool,
         auto_clear: bool,
     ) -> Result<(), Error> {
         let device_fd = self.device.as_raw_fd() as c_int;
-
-        // Attach the file => Associate the loop device with the open file
-        let code = unsafe { ioctl(device_fd, LOOP_SET_FD.into(), file_fd) };
-
-        if code < 0 {
-            return Err(Error::AssociateWithOpenFile);
-        }
 
         // Set offset and limit for backing_file
         log::debug!("Setting offset {} and limit {}", offset, sizelimit);
@@ -153,7 +168,9 @@ impl LoopDevice {
                 }
                 nix::Result::Err(Sys(Errno::EAGAIN)) => {
                     // this error means the call should be retried
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    let delay = 50;
+                    log::debug!("ioctl busy, retry in {}ms", delay);
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
                 }
                 nix::Result::Err(e) => {
                     self.detach()?;
@@ -252,11 +269,9 @@ pub(super) async fn losetup(
     lo_size: u64,
 ) -> Result<LoopDevice, Error> {
     let start = time::Instant::now();
-    let loop_device = lc.next_free().await?;
+    let loop_device = lc.attach_next_free(file_fd).await?;
 
-    debug!("Using loop device {:?}", loop_device.path().await);
-
-    loop_device.attach_file(file_fd, fs_offset, lo_size, true, true)?;
+    loop_device.configure(fs_offset, lo_size, true, true)?;
 
     if let Err(error) = loop_device.set_direct_io(true) {
         warn!("Failed to enable direct io: {:?}", error);
